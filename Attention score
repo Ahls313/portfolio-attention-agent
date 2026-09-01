@@ -1,0 +1,210 @@
+"""
+Portfolio Attention Score
+--------------------------
+A volatility-adjusted alerting system for crypto portfolios.
+
+Most "portfolio alert" tools use a flat threshold (e.g. "alert me if a coin
+moves more than 2%"). That's noisy: a coin that normally swings 8% a day
+moving 3% is nothing, while a coin that normally moves 0.4% a day moving 3%
+is a real signal. This script fixes that by scoring each holding's move
+relative to its OWN historical volatility, not a fixed number.
+
+It combines three signals into one 0-100 "Attention Score" per holding:
+  1. Volatility-adjusted deviation (is this move unusual for THIS asset?)
+  2. Market correlation (is this move isolated, or is the whole market doing it?)
+  3. News correlation confidence (is there an actual headline that explains it?)
+
+Data sources:
+  - Price history: Binance public klines endpoint (no auth needed)
+  - Holdings: user-supplied list (kept local, never requires API keys/secrets)
+  - News: headline list passed in (from Binance MCP news tool or manual input)
+"""
+
+import math
+from dataclasses import dataclass
+from typing import Optional
+
+
+@dataclass
+class Holding:
+    symbol: str          # e.g. "BTC"
+    amount: float
+    today_pct_change: float          # e.g. -4.2 for -4.2%
+    historical_daily_moves: list      # last N days of % changes, e.g. last 30 days
+
+
+@dataclass
+class NewsItem:
+    headline: str
+    related_symbols: list             # which coins this headline plausibly affects
+
+
+def volatility_adjusted_deviation(holding: Holding) -> float:
+    """
+    Returns a z-score: how many standard deviations today's move is
+    from this asset's own historical daily average move.
+    A z-score of 0.5 = boring/normal. A z-score of 2.5+ = unusual.
+    """
+    moves = holding.historical_daily_moves
+    if len(moves) < 5:
+        return 0.0  # not enough history to judge, don't overreact
+
+    mean = sum(moves) / len(moves)
+    variance = sum((m - mean) ** 2 for m in moves) / len(moves)
+    std_dev = math.sqrt(variance)
+
+    if std_dev == 0:
+        return 0.0
+
+    z_score = abs(holding.today_pct_change - mean) / std_dev
+    return round(z_score, 2)
+
+
+def market_isolation_score(holding: Holding, market_avg_move_pct: float) -> float:
+    """
+    Returns 0-1: how isolated this move is from the broader market.
+    0 = perfectly tracks the market (not asset-specific)
+    1 = completely isolated (this coin is doing its own thing)
+    """
+    if market_avg_move_pct == 0:
+        divergence = abs(holding.today_pct_change)
+    else:
+        divergence = abs(holding.today_pct_change - market_avg_move_pct)
+
+    # Normalize: treat a 5%+ divergence from market as fully isolated
+    return round(min(divergence / 5.0, 1.0), 2)
+
+
+def news_confidence_score(symbol: str, news_items: list) -> float:
+    """
+    Returns 0-1: how directly relevant available news is to this holding.
+    This is intentionally conservative, no news match = 0, not a guess.
+    """
+    matches = [n for n in news_items if symbol in n.related_symbols]
+    if not matches:
+        return 0.0
+    # More directly relevant headlines = higher confidence, capped at 1.0
+    return round(min(len(matches) * 0.4, 1.0), 2)
+
+
+def attention_score(holding: Holding, market_avg_move_pct: float, news_items: list) -> dict:
+    """
+    Combines the three signals into a single 0-100 Attention Score
+    and a human-readable verdict.
+    """
+    z = volatility_adjusted_deviation(holding)
+    isolation = market_isolation_score(holding, market_avg_move_pct)
+    news_conf = news_confidence_score(holding.symbol, news_items)
+
+    # Weighting: unusual-for-this-asset move matters most,
+    # isolation from market matters second, news confidence adjusts framing
+    z_component = min(z / 3.0, 1.0) * 60      # cap z=3 as "max unusual"
+    isolation_component = isolation * 30
+    news_component = news_conf * 10
+
+    score = round(z_component + isolation_component + news_component, 1)
+
+    if score >= 65:
+        verdict = "worth checking in"
+    elif score >= 35:
+        verdict = "mild, keep an eye"
+    else:
+        verdict = "nothing to see here"
+
+    explanation = _build_explanation(holding, z, isolation, news_conf, news_items)
+
+    return {
+        "symbol": holding.symbol,
+        "score": score,
+        "verdict": verdict,
+        "z_score": z,
+        "isolation": isolation,
+        "news_confidence": news_conf,
+        "explanation": explanation,
+    }
+
+
+def _build_explanation(holding, z, isolation, news_conf, news_items) -> str:
+    parts = []
+
+    if z >= 2.5:
+        parts.append(f"{holding.symbol} moved {holding.today_pct_change:+.1f}%, "
+                      f"which is highly unusual for this asset (z={z}).")
+    elif z >= 1.2:
+        parts.append(f"{holding.symbol} moved {holding.today_pct_change:+.1f}%, "
+                      f"somewhat above its normal daily range (z={z}).")
+    else:
+        parts.append(f"{holding.symbol} moved {holding.today_pct_change:+.1f}%, "
+                      f"within its normal range for this asset.")
+
+    if isolation >= 0.7:
+        parts.append("This move is isolated to this asset, not the broader market.")
+    elif isolation <= 0.3:
+        parts.append("This tracks the broader market move, likely not asset-specific.")
+
+    if news_conf > 0:
+        matched = [n.headline for n in news_items if holding.symbol in n.related_symbols]
+        parts.append(f"Possibly explained by: {matched[0]}")
+    else:
+        parts.append("No clear news match found for this move.")
+
+    return " ".join(parts)
+
+
+def run_portfolio_scan(holdings: list, market_avg_move_pct: float, news_items: list):
+    results = [attention_score(h, market_avg_move_pct, news_items) for h in holdings]
+    results.sort(key=lambda r: r["score"], reverse=True)
+    return results
+
+
+if __name__ == "__main__":
+    # ---- SAMPLE DATA for local testing (replace with real MCP data at demo time) ----
+    sample_holdings = [
+        Holding(
+            symbol="BTC",
+            amount=0.05,
+            today_pct_change=-4.1,
+            historical_daily_moves=[0.5, -0.3, 0.8, -0.6, 0.2, -0.4, 0.9, -0.7, 0.3,
+                                     -0.2, 0.6, -0.5, 0.4, -0.3, 0.7, -0.6, 0.2, -0.4,
+                                     0.5, -0.3, 0.6, -0.5, 0.4, -0.2, 0.3, -0.4, 0.5,
+                                     -0.3, 0.6, -0.4],
+        ),
+        Holding(
+            symbol="DOGE",
+            amount=500,
+            today_pct_change=3.2,
+            historical_daily_moves=[2.1, -3.4, 4.2, -2.8, 3.1, -4.0, 2.9, -3.2, 3.8,
+                                     -2.5, 3.3, -3.9, 2.7, -3.1, 4.1, -2.9, 3.4, -3.6,
+                                     2.8, -3.3, 3.9, -2.7, 3.2, -3.5, 2.6, -3.8, 3.5,
+                                     -2.9, 3.1, -3.4],
+        ),
+        Holding(
+            symbol="ETH",
+            amount=0.8,
+            today_pct_change=-0.8,
+            historical_daily_moves=[0.4, -0.5, 0.6, -0.3, 0.5, -0.4, 0.7, -0.6, 0.3,
+                                     -0.5, 0.6, -0.4, 0.5, -0.3, 0.6, -0.5, 0.4, -0.3,
+                                     0.5, -0.4, 0.6, -0.5, 0.4, -0.3, 0.5, -0.4, 0.6,
+                                     -0.5, 0.4, -0.3],
+        ),
+    ]
+
+    sample_news = [
+        NewsItem(
+            headline="Major exchange reports BTC outflow spike amid regulatory concerns",
+            related_symbols=["BTC"],
+        ),
+        NewsItem(
+            headline="DOGE sees renewed retail interest after social media mention",
+            related_symbols=["DOGE"],
+        ),
+    ]
+
+    market_avg = -0.9  # e.g. overall market down 0.9% today
+
+    results = run_portfolio_scan(sample_holdings, market_avg, sample_news)
+
+    print("=== Portfolio Attention Scan ===\n")
+    for r in results:
+        print(f"{r['symbol']}: Score {r['score']}/100 — {r['verdict'].upper()}")
+        print(f"  {r['explanation']}\n")
