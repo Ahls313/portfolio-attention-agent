@@ -9,19 +9,28 @@ moving 3% is nothing, while a coin that normally moves 0.4% a day moving 3%
 is a real signal. This script fixes that by scoring each holding's move
 relative to its OWN historical volatility, not a fixed number.
 
-It combines three signals into one 0-100 "Attention Score" per holding:
-  1. Volatility-adjusted deviation (is this move unusual for THIS asset?)
+It combines four signals into one 0-100 "Attention Score" per holding:
+  1. Volatility-adjusted deviation (is this move unusual for THIS asset?),
+     using a recency-weighted baseline so the last few days matter more
+     than day 30.
   2. Market correlation (is this move isolated, or is the whole market doing it?)
-  3. News correlation confidence (is there an actual headline that explains it?)
+  3. Volume confirmation (is unusual volume backing the price move, or is
+     it a thin-book flicker?)
+  4. News correlation confidence (is there an actual headline that explains it?)
+
+The score also supports a rolling history per symbol, so a coin that's been
+climbing in attention for 3 straight days surfaces differently than a coin
+that spiked once and settled back down.
 
 Data sources:
   - Price history: Binance public klines endpoint (no auth needed)
+  - Volume: Binance public klines / 24hr ticker (no auth needed)
   - Holdings: user-supplied list (kept local, never requires API keys/secrets)
   - News: headline list passed in (from Binance MCP news tool or manual input)
 """
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 
@@ -30,7 +39,9 @@ class Holding:
     symbol: str          # e.g. "BTC"
     amount: float
     today_pct_change: float          # e.g. -4.2 for -4.2%
-    historical_daily_moves: list      # last N days of % changes, e.g. last 30 days
+    historical_daily_moves: list      # oldest -> newest, e.g. last 30 days
+    today_volume: Optional[float] = None        # today's traded volume (base or quote units)
+    avg_daily_volume: Optional[float] = None    # baseline average daily volume
 
 
 @dataclass
@@ -39,24 +50,46 @@ class NewsItem:
     related_symbols: list             # which coins this headline plausibly affects
 
 
+def _decay_weights(n: int, half_life_days: float = 7.0) -> list:
+    """
+    Exponential decay weights for n data points ordered oldest -> newest.
+    The most recent point gets weight 1.0; older points decay by half
+    every `half_life_days`. This makes the volatility baseline reflect
+    current market regime rather than treating day 1 and day 30 the same.
+    """
+    decay = math.log(2) / half_life_days
+    # index n-1 is most recent -> exponent 0; index 0 is oldest -> largest exponent
+    return [math.exp(-decay * (n - 1 - i)) for i in range(n)]
+
+
 def volatility_adjusted_deviation(holding: Holding) -> float:
     """
     Returns a z-score: how many standard deviations today's move is
-    from this asset's own historical daily average move.
+    from this asset's own RECENCY-WEIGHTED historical daily average move.
     A z-score of 0.5 = boring/normal. A z-score of 2.5+ = unusual.
+
+    Recent days are weighted more heavily than older ones (7-day half-life),
+    so a baseline computed during a calm month doesn't understate what's
+    "normal" once volatility has already picked up recently, and vice versa.
     """
     moves = holding.historical_daily_moves
-    if len(moves) < 5:
+    n = len(moves)
+    if n < 5:
         return 0.0  # not enough history to judge, don't overreact
 
-    mean = sum(moves) / len(moves)
-    variance = sum((m - mean) ** 2 for m in moves) / len(moves)
-    std_dev = math.sqrt(variance)
+    weights = _decay_weights(n)
+    total_weight = sum(weights)
+
+    weighted_mean = sum(w * m for w, m in zip(weights, moves)) / total_weight
+    weighted_variance = sum(
+        w * (m - weighted_mean) ** 2 for w, m in zip(weights, moves)
+    ) / total_weight
+    std_dev = math.sqrt(weighted_variance)
 
     if std_dev == 0:
         return 0.0
 
-    z_score = abs(holding.today_pct_change - mean) / std_dev
+    z_score = abs(holding.today_pct_change - weighted_mean) / std_dev
     return round(z_score, 2)
 
 
@@ -73,6 +106,29 @@ def market_isolation_score(holding: Holding, market_avg_move_pct: float) -> floa
 
     # Normalize: treat a 5%+ divergence from market as fully isolated
     return round(min(divergence / 5.0, 1.0), 2)
+
+
+def volume_confirmation_score(holding: Holding) -> float:
+    """
+    Returns 0-1: does trading volume back up the price move, or is this
+    a thin-book flicker that shouldn't be trusted?
+
+    A big % move on normal (or below-normal) volume is often noise from a
+    low-liquidity moment; the same move on a volume spike is more likely
+    a real, broad-based reaction. Returns 0.0 (neutral, not penalized) when
+    volume data isn't available, since it's an optional signal.
+    """
+    if not holding.today_volume or not holding.avg_daily_volume:
+        return 0.0
+    if holding.avg_daily_volume == 0:
+        return 0.0
+
+    volume_ratio = holding.today_volume / holding.avg_daily_volume
+
+    if volume_ratio <= 1.0:
+        return 0.0        # at or below normal volume, no confirmation
+    # 1x -> 0.0, 2x -> 0.5, 3x+ -> 1.0 (capped)
+    return round(min((volume_ratio - 1.0) / 2.0, 1.0), 2)
 
 
 def news_confidence_score(symbol: str, news_items: list) -> float:
@@ -94,15 +150,18 @@ def attention_score(holding: Holding, market_avg_move_pct: float, news_items: li
     """
     z = volatility_adjusted_deviation(holding)
     isolation = market_isolation_score(holding, market_avg_move_pct)
+    volume_conf = volume_confirmation_score(holding)
     news_conf = news_confidence_score(holding.symbol, news_items)
 
-    # Weighting: unusual-for-this-asset move matters most,
-    # isolation from market matters second, news confidence adjusts framing
-    z_component = min(z / 3.0, 1.0) * 60      # cap z=3 as "max unusual"
-    isolation_component = isolation * 30
+    # Weighting: unusual-for-this-asset move matters most, isolation from
+    # market matters second, volume confirmation adds/removes confidence,
+    # news confidence adjusts framing on top.
+    z_component = min(z / 3.0, 1.0) * 50       # cap z=3 as "max unusual"
+    isolation_component = isolation * 25
+    volume_component = volume_conf * 15
     news_component = news_conf * 10
 
-    score = round(z_component + isolation_component + news_component, 1)
+    score = round(z_component + isolation_component + volume_component + news_component, 1)
 
     if score >= 65:
         verdict = "worth checking in"
@@ -111,7 +170,7 @@ def attention_score(holding: Holding, market_avg_move_pct: float, news_items: li
     else:
         verdict = "nothing to see here"
 
-    explanation = _build_explanation(holding, z, isolation, news_conf, news_items)
+    explanation = _build_explanation(holding, z, isolation, volume_conf, news_conf, news_items)
 
     return {
         "symbol": holding.symbol,
@@ -119,12 +178,13 @@ def attention_score(holding: Holding, market_avg_move_pct: float, news_items: li
         "verdict": verdict,
         "z_score": z,
         "isolation": isolation,
+        "volume_confirmation": volume_conf,
         "news_confidence": news_conf,
         "explanation": explanation,
     }
 
 
-def _build_explanation(holding, z, isolation, news_conf, news_items) -> str:
+def _build_explanation(holding, z, isolation, volume_conf, news_conf, news_items) -> str:
     parts = []
 
     if z >= 2.5:
@@ -142,6 +202,11 @@ def _build_explanation(holding, z, isolation, news_conf, news_items) -> str:
     elif isolation <= 0.3:
         parts.append("This tracks the broader market move, likely not asset-specific.")
 
+    if volume_conf >= 0.5:
+        parts.append("Volume is well above normal, backing up the move as likely real.")
+    elif holding.today_volume and holding.avg_daily_volume and volume_conf == 0.0:
+        parts.append("Volume is at/below normal — worth treating the move with some caution.")
+
     if news_conf > 0:
         matched = [n.headline for n in news_items if holding.symbol in n.related_symbols]
         parts.append(f"Possibly explained by: {matched[0]}")
@@ -157,6 +222,40 @@ def run_portfolio_scan(holdings: list, market_avg_move_pct: float, news_items: l
     return results
 
 
+def score_trend(score_history: list) -> dict:
+    """
+    Given a list of past Attention Scores for ONE symbol, ordered oldest
+    to newest (e.g. [41.2, 48.0, 63.5] for the last 3 days), returns a
+    trend read. A coin climbing steadily in attention over multiple days
+    is a different (and often more important) story than a single-day
+    spike that a snapshot alone can't tell you.
+    """
+    if len(score_history) < 2:
+        return {"direction": "insufficient history", "delta": 0.0, "streak": 0}
+
+    delta = round(score_history[-1] - score_history[0], 1)
+
+    streak = 1
+    for i in range(len(score_history) - 1, 0, -1):
+        if score_history[i] > score_history[i - 1]:
+            streak += 1
+        else:
+            break
+    else:
+        streak = len(score_history)
+
+    if streak >= 3 and delta > 5:
+        direction = f"climbing for {streak} days straight"
+    elif delta > 10:
+        direction = "rising sharply"
+    elif delta < -10:
+        direction = "cooling off"
+    else:
+        direction = "stable"
+
+    return {"direction": direction, "delta": delta, "streak": streak}
+
+
 if __name__ == "__main__":
     # ---- SAMPLE DATA for local testing (replace with real MCP data at demo time) ----
     sample_holdings = [
@@ -168,6 +267,8 @@ if __name__ == "__main__":
                                      -0.2, 0.6, -0.5, 0.4, -0.3, 0.7, -0.6, 0.2, -0.4,
                                      0.5, -0.3, 0.6, -0.5, 0.4, -0.2, 0.3, -0.4, 0.5,
                                      -0.3, 0.6, -0.4],
+            today_volume=42_000,
+            avg_daily_volume=14_500,   # ~2.9x normal volume -> confirms the move
         ),
         Holding(
             symbol="DOGE",
@@ -177,6 +278,8 @@ if __name__ == "__main__":
                                      -2.5, 3.3, -3.9, 2.7, -3.1, 4.1, -2.9, 3.4, -3.6,
                                      2.8, -3.3, 3.9, -2.7, 3.2, -3.5, 2.6, -3.8, 3.5,
                                      -2.9, 3.1, -3.4],
+            today_volume=8_200_000,
+            avg_daily_volume=7_900_000,  # roughly normal volume -> weak confirmation
         ),
         Holding(
             symbol="ETH",
@@ -186,6 +289,8 @@ if __name__ == "__main__":
                                      -0.5, 0.6, -0.4, 0.5, -0.3, 0.6, -0.5, 0.4, -0.3,
                                      0.5, -0.4, 0.6, -0.5, 0.4, -0.3, 0.5, -0.4, 0.6,
                                      -0.5, 0.4, -0.3],
+            today_volume=310_000,
+            avg_daily_volume=305_000,  # normal volume
         ),
     ]
 
@@ -208,3 +313,10 @@ if __name__ == "__main__":
     for r in results:
         print(f"{r['symbol']}: Score {r['score']}/100 — {r['verdict'].upper()}")
         print(f"  {r['explanation']}\n")
+
+    # ---- Trend tracking demo: BTC's attention score over the last 3 days ----
+    btc_score_history = [38.5, 55.0, results[0]["score"]]  # e.g. pulled from a small local log
+    trend = score_trend(btc_score_history)
+    print("=== Trend Check: BTC ===")
+    print(f"  Score history: {btc_score_history}")
+    print(f"  Trend: {trend['direction']} (Δ{trend['delta']:+.1f} over the window)\n")
