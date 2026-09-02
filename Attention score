@@ -42,6 +42,7 @@ class Holding:
     historical_daily_moves: list      # oldest -> newest, e.g. last 30 days
     today_volume: Optional[float] = None        # today's traded volume (base or quote units)
     avg_daily_volume: Optional[float] = None    # baseline average daily volume
+    historical_daily_volumes: Optional[list] = None  # oldest -> newest, same length as historical_daily_moves
 
 
 @dataclass
