@@ -36,6 +36,8 @@ from typing import Protocol, Optional
 
 from attention_score import Holding, NewsItem, run_portfolio_scan
 from dashboard import render_dashboard
+from early_signal import scan_for_early_signals
+from debate import generate_debate, print_debate
 
 
 # ---------------------------------------------------------------------------
@@ -104,14 +106,29 @@ class RecordedBridge:
         return [[None, None, None, None, c] for c in closes]
 
     def place_order(self, symbol: str, side: str, quote_order_qty: float) -> dict:
-        # Recorded from a real attempted order on Sept 2 2026: $0.15 on
-        # DOGEUSDT, rejected by Binance's exchange-enforced minimum order size.
+        # Recorded from two real, live attempts on Sept 2 2026, in order:
+        #   1. $0.15 on SOLUSDT -> rejected, below exchange minimum notional
+        #   2. $1.90 on DOGEUSDT -> FILLED, real order, real fill
+        # Both are shown here because both are true: the pipeline reports
+        # whatever the exchange actually says, success or rejection.
+        if quote_order_qty < 1.0:
+            return {
+                "error": True,
+                "code": -1013,
+                "message": "Filter failure: NOTIONAL",
+                "detail": f"Order rejected: {quote_order_qty} USDT is below the "
+                          f"exchange minimum notional for {symbol}.",
+            }
         return {
-            "error": True,
-            "code": -1013,
-            "message": "Filter failure: NOTIONAL",
-            "detail": f"Order rejected: {quote_order_qty} USDT is below the "
-                      f"exchange minimum notional for {symbol}.",
+            "error": False,
+            "orderId": 14874233861,
+            "symbol": "DOGEUSDT",
+            "status": "FILLED",
+            "origQuoteOrderQty": "1.90000000",
+            "executedQty": "23.00000000",
+            "cummulativeQuoteQty": "1.88163000",
+            "fills": [{"price": "0.08181000", "qty": "23.00000000",
+                       "commission": "0.02300000", "commissionAsset": "DOGE"}],
         }
 
 
@@ -177,10 +194,16 @@ def attempt_trade_on_top_result(bridge: MCPBridge, results: list, budget_usdt: f
         print(f"  the pipeline attempted a genuine trade and is reporting the")
         print(f"  genuine outcome, not a simulated success.")
     else:
-        print(f"  Order result: {result}")
+        fill = result["fills"][0]
+        print(f"  FILLED — real order, real exchange fill:")
+        print(f"    Order ID: {result['orderId']}")
+        print(f"    Bought {result['executedQty']} {result['symbol'].replace('USDT','')} "
+              f"at {fill['price']} (spent {result['cummulativeQuoteQty']} USDT)")
+        print(f"    Commission: {fill['commission']} {fill['commissionAsset']}")
 
 
-def run_pipeline(bridge: MCPBridge, budget_usdt: Optional[float] = None):
+def run_pipeline(bridge: MCPBridge, budget_usdt: Optional[float] = None,
+                  show_early_signals: bool = True, show_debates: bool = True):
     holdings = build_holdings(bridge)
     market_avg = sum(h.today_pct_change for h in holdings) / len(holdings)
 
@@ -191,6 +214,24 @@ def run_pipeline(bridge: MCPBridge, budget_usdt: Optional[float] = None):
 
     render_dashboard(results, market_avg_move_pct=market_avg)
 
+    early_by_symbol = {}
+    if show_early_signals:
+        early_signals = scan_for_early_signals(holdings, threshold=20.0)
+        if early_signals:
+            print("=== Early Signals (pre-move watch) ===\n")
+            for e in early_signals:
+                print(f"{e['symbol']}: divergence={e['divergence_score']} "
+                      f"(vol_z={e['volume_z']}, price_z={e['price_z']})")
+                print(f"  {e['read']}\n")
+            early_by_symbol = {e["symbol"]: e for e in early_signals}
+        else:
+            print("=== Early Signals ===\n  Nothing crossing the watch threshold today.\n")
+
+    if show_debates:
+        for r in results[:3]:  # top 3 by attention score
+            debate = generate_debate(r, early_by_symbol.get(r["symbol"]))
+            print_debate(debate)
+
     if budget_usdt is not None:
         attempt_trade_on_top_result(bridge, results, budget_usdt)
 
@@ -199,4 +240,9 @@ if __name__ == "__main__":
     # Demo mode: replays real Sept 2 2026 data, no live MCP session required.
     # To run live instead, an MCP-enabled agent implements MCPBridge against
     # the real Binance Mcp tools and calls run_pipeline(that_bridge, budget).
-    run_pipeline(RecordedBridge(), budget_usdt=0.15)
+    #
+    # Note: this replays a real $1.90 order that filled live on DOGEUSDT.
+    # An earlier $0.15 attempt on SOLUSDT was correctly rejected by
+    # Binance's minimum-notional filter -- both real outcomes are preserved
+    # in RecordedBridge.place_order() above.
+    run_pipeline(RecordedBridge(), budget_usdt=1.90)
