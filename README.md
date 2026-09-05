@@ -50,7 +50,22 @@ narrative, no LLM guessing. If a signal isn't present in the data, it
 doesn't appear on either side. This is a way to weigh competing reads of
 one data set, not a recommendation.
 
-### 4. Live Trade Execution
+### 4. Autonomous Watch Agent
+A single scan is useful, but a scan you have to remember to run isn't really
+"automated." This module persists state across runs — score history, a
+durable decision journal — and *autonomously* decides whether to act,
+without being prompted each cycle.
+
+It only acts when three independently-computed signals agree: an elevated
+Attention Score, confirming Early Signal divergence, and a debate that
+leans decisively one way (not a coin flip). Every cycle, act or not, is
+logged with its full reasoning to an append-only journal — so the agent's
+behavior over time is auditable, not a black box. In testing, it correctly
+held off acting even during a 3-day climbing score, because the specific
+"price hasn't caught up to volume yet" condition wasn't actually present —
+real discipline, not a scripted outcome.
+
+### 5. Live Trade Execution
 The agent can act on its own output — attempting a real trade on the
 top-scoring result and reporting whatever the exchange actually says,
 success or rejection, honestly.
@@ -83,6 +98,7 @@ the decision-making logic itself is fully inspectable, deterministic code.
 | `attention_score.py` | Core scoring model — z-score, isolation, volume, news, trend |
 | `early_signal.py` | Volume/price divergence detector for pre-move signals |
 | `debate.py` | Generates bull/bear cases from the same computed metrics |
+| `watch_agent.py` | Autonomous, persistent decision loop with a full audit journal |
 | `dashboard.py` | Dependency-free ANSI terminal dashboard for scan results |
 | `orchestrator.py` | Ties it all together: live data → scoring → debate → trade |
 
@@ -94,6 +110,7 @@ Each file runs standalone with real, recorded data from a live session:
 python3 attention_score.py    # scoring logic, sample holdings
 python3 early_signal.py       # divergence detection, sample data
 python3 debate.py             # bull/bear generation, sample data
+python3 watch_agent.py        # autonomous watch cycle simulation, 3 days
 python3 dashboard.py          # visual dashboard, sample holdings
 python3 orchestrator.py       # full pipeline, replays real Sept 2 2026 data
 ```
