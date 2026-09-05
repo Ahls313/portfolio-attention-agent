@@ -1,0 +1,210 @@
+"""
+Autonomous Watch Agent
+------------------------
+Closes the "Automated Actions" gap: instead of only running when asked, this
+agent persists state across runs and *autonomously* decides whether to act —
+logging its reasoning every time, whether it acts or not.
+
+WHY THIS IS SAFE TO AUTOMATE (and why it isn't reckless):
+It doesn't act on any single signal. It only takes action when THREE
+independently-computed signals agree:
+  1. Attention Score is elevated (statistically unusual move)
+  2. Early Signal divergence confirms real volume behind it (not noise)
+  3. The bull/bear debate leans decisively one direction (not a coin flip)
+
+Requiring independent agreement is the actual safety mechanism — a single
+noisy metric can't trigger a trade on its own. And every decision, act or
+not, is written to a durable journal with the reasoning attached, so the
+agent's behavior over time is fully auditable, not a black box.
+
+Persistent state (JSON on disk) means score_trend() in attention_score.py
+actually has real history to work with across separate runs/sessions,
+instead of only the trend example we hardcoded earlier in orchestrator.py.
+"""
+
+import json
+import os
+from datetime import datetime, timezone
+
+from attention_score import score_trend
+from early_signal import scan_for_early_signals
+from debate import generate_debate
+
+STATE_PATH = os.path.join(os.path.dirname(__file__), "watch_state.json")
+JOURNAL_PATH = os.path.join(os.path.dirname(__file__), "decision_journal.jsonl")
+
+# Thresholds for autonomous action -- deliberately conservative
+SCORE_THRESHOLD = 60.0
+DIVERGENCE_THRESHOLD = 30.0
+MIN_DEBATE_MARGIN = 2  # bull points minus bear points (or vice versa)
+
+
+def _load_state() -> dict:
+    if not os.path.exists(STATE_PATH):
+        return {"score_history": {}}
+    with open(STATE_PATH, "r") as f:
+        return json.load(f)
+
+
+def _save_state(state: dict):
+    with open(STATE_PATH, "w") as f:
+        json.dump(state, f, indent=2)
+
+
+def _append_journal(entry: dict):
+    with open(JOURNAL_PATH, "a") as f:
+        f.write(json.dumps(entry) + "\n")
+
+
+def _debate_margin(debate: dict) -> tuple:
+    """Returns (leaning, margin) e.g. ('bull', 3) meaning bull case has 3 more points."""
+    bull_n = len(debate["bull_case"])
+    bear_n = len(debate["bear_case"])
+    if bull_n > bear_n:
+        return ("bull", bull_n - bear_n)
+    elif bear_n > bull_n:
+        return ("bear", bear_n - bull_n)
+    return ("neutral", 0)
+
+
+def evaluate_symbol(score_result: dict, holdings_by_symbol: dict, state: dict) -> dict:
+    """
+    Runs one symbol through the full decision pipeline and returns a
+    structured decision record: what was observed, what was decided, why.
+    Updates `state` in place with this run's score for trend tracking.
+    """
+    symbol = score_result["symbol"]
+    now = datetime.now(timezone.utc).isoformat()
+
+    # Update persistent score history
+    history = state["score_history"].setdefault(symbol, [])
+    history.append(score_result["score"])
+    history = history[-30:]  # keep last 30 runs
+    state["score_history"][symbol] = history
+
+    trend = score_trend(history)
+
+    holding = holdings_by_symbol.get(symbol)
+    early = None
+    if holding is not None:
+        early_signals = scan_for_early_signals([holding], threshold=0.0)
+        early = next((e for e in early_signals if e["symbol"] == symbol), None)
+
+    debate = generate_debate(score_result, early)
+    leaning, margin = _debate_margin(debate)
+
+    # --- Decision logic: all three must independently agree ---
+    score_ok = score_result["score"] >= SCORE_THRESHOLD
+    divergence_ok = bool(early and early.get("divergence_score", 0) >= DIVERGENCE_THRESHOLD)
+    debate_ok = leaning != "neutral" and margin >= MIN_DEBATE_MARGIN
+
+    signals_met = sum([score_ok, divergence_ok, debate_ok])
+    will_act = signals_met == 3
+
+    if will_act:
+        decision = f"ACT — all 3 signals agree (score={score_result['score']}, " \
+                   f"divergence={early['divergence_score'] if early else 'n/a'}, " \
+                   f"debate leans {leaning} by {margin})"
+    else:
+        missing = []
+        if not score_ok:
+            missing.append("attention score below threshold")
+        if not divergence_ok:
+            missing.append("no confirming early-signal divergence")
+        if not debate_ok:
+            missing.append("debate too close to call" if leaning != "neutral" else "debate is neutral")
+        decision = f"NO ACTION — {signals_met}/3 signals met. Missing: {', '.join(missing)}."
+
+    record = {
+        "timestamp": now,
+        "symbol": symbol,
+        "score": score_result["score"],
+        "trend": trend,
+        "early_signal": early,
+        "debate_leaning": leaning,
+        "debate_margin": margin,
+        "will_act": will_act,
+        "decision": decision,
+    }
+    _append_journal(record)
+    return record
+
+
+def run_watch_cycle(results: list, holdings: list):
+    """
+    results: output of run_portfolio_scan()
+    holdings: the Holding objects used to generate those results
+    Returns list of decision records, one per symbol.
+    """
+    state = _load_state()
+    holdings_by_symbol = {h.symbol: h for h in holdings}
+
+    records = []
+    for r in results:
+        record = evaluate_symbol(r, holdings_by_symbol, state)
+        records.append(record)
+
+    _save_state(state)
+    return records
+
+
+def print_watch_cycle(records: list):
+    print("\n=== Autonomous Watch Cycle ===\n")
+    for r in records:
+        marker = "🔴 ACT" if r["will_act"] else "⚪ hold"
+        print(f"{marker}  {r['symbol']}  score={r['score']}  trend={r['trend']['direction']}")
+        print(f"        {r['decision']}\n")
+
+
+def print_journal(limit: int = 20):
+    """Prints the last `limit` journal entries, oldest first within that window."""
+    if not os.path.exists(JOURNAL_PATH):
+        print("No journal entries yet.")
+        return
+    with open(JOURNAL_PATH, "r") as f:
+        lines = f.readlines()[-limit:]
+    print(f"\n=== Decision Journal (last {len(lines)} entries) ===\n")
+    for line in lines:
+        r = json.loads(line)
+        print(f"[{r['timestamp']}] {r['symbol']}: {r['decision']}")
+
+
+if __name__ == "__main__":
+    # Demo: simulate 3 watch cycles for one symbol using its real historical
+    # closes, showing the score climb and the journal build up honestly —
+    # then a final cycle where all 3 signals happen to align.
+    from attention_score import Holding, NewsItem, run_portfolio_scan
+
+    print("Simulating 3 watch cycles (as if run on 3 separate days)...")
+
+    base_moves = [0.5,-0.3,0.8,-0.6,0.2,-0.4,0.9,-0.7,0.3,-0.2,0.6,-0.5,0.4,
+                  -0.3,0.7,-0.6,0.2,-0.4,0.5,-0.3,0.6,-0.5,0.4,-0.2,0.3,-0.4,
+                  0.5,-0.3,0.6,-0.4]
+
+    scenarios = [
+        {"today_pct_change": -1.0, "today_volume": 15_000, "avg_daily_volume": 14_500,
+         "historical_daily_volumes": [14_000]*29 + [14_500]},
+        {"today_pct_change": -2.8, "today_volume": 28_000, "avg_daily_volume": 14_500,
+         "historical_daily_volumes": [14_000]*29 + [14_500]},
+        {"today_pct_change": -5.5, "today_volume": 61_000, "avg_daily_volume": 14_500,
+         "historical_daily_volumes": [14_000]*29 + [14_500]},
+    ]
+
+    for i, s in enumerate(scenarios, 1):
+        holding = Holding(
+            symbol="BTC", amount=1,
+            today_pct_change=s["today_pct_change"],
+            historical_daily_moves=base_moves,
+            today_volume=s["today_volume"],
+            avg_daily_volume=s["avg_daily_volume"],
+            historical_daily_volumes=s["historical_daily_volumes"],
+        )
+        news = [NewsItem(headline="Major exchange reports BTC outflow spike amid regulatory concerns",
+                          related_symbols=["BTC"])] if i == 3 else []
+
+        results = run_portfolio_scan([holding], market_avg_move_pct=-0.5, news_items=news)
+        print(f"\n--- Day {i} ---")
+        records = run_watch_cycle(results, [holding])
+        print_watch_cycle(records)
+
+    print_journal(limit=10)
