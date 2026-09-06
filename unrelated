@@ -1,0 +1,162 @@
+Below is an elaborate, self-contained report/prompt you can paste directly into Claude. It summarizes the repository state (files in root), states your project philosophy, lists concrete, prioritized changes, provides exact JSON schemas and function signatures, and asks Claude to generate starter code and/or concrete patches. Paste everything as-is into Claude.
+
+---
+
+Context
+I have a GitHub repo: Ahls313/portfolio-attention-agent (branch main). Files in the repository root:
+- Attention score
+- Dashboard
+- Debate
+- Early signal
+- Live Scan demo
+- Orchestrator
+- README.md
+- Watch Agent
+
+My project's core differentiator and design philosophy:
+- Refuse to act on unconfirmed / low-confidence signals. Prioritize statistical honesty over hype.
+- Make decision-making auditable and traceable: every signal, vote, veto, and final decision must be recorded with provenance, model/version metadata, and the exact evidence used.
+- Use data-driven thresholds (backtest-derived) to determine when to abstain rather than heuristics.
+
+Primary goals for Claude
+1) Analyze the repository file named "Attention score" (URL: https://github.com/Ahls313/portfolio-attention-agent/blob/main/Attention%20score). Provide suggestions to transform the module into a calibrated, explainable scoring function that returns both raw score and a calibrated probability plus per-feature contributions.
+2) Produce concrete, ready-to-drop starter python modules and edits that implement the audit-first, abstain-by-calibration workflow. For each new file or change, produce code, docstrings, and minimal tests/examples. Prefer minimal external dependencies but allow pandas/scikit-learn if needed for calibration/backtesting.
+3) Provide an integration plan (specific code hooks) so these new modules will be used by Early signal, Debate, Watch Agent, Orchestrator, and Dashboard modules.
+
+Deliverables requested from Claude
+A. Analysis & transformation suggestions for "Attention score"
+- Read the file at the URL and produce a concise summary of what it currently computes (functions, inputs, outputs, side effects).
+- Recommend exact code-level changes to make it return a structured dict instead of a single float or text. The dict should include:
+  - score: raw model score or combined indicator value (float)
+  - prob: calibrated probability in [0,1] derived from backtester/calibrator (float)
+  - features: dict of per-feature contributions (e.g., {"rsi":0.12,"volume_z":0.22})
+  - evidence_refs: list of references to raw data snapshots (timestamps or file URLs)
+  - model_version: string
+  - git_sha: string
+- Provide the complete modified Attention score module code (with imports, typing, docstring) that:
+  - Accepts symbol and raw OHLCV series (as pandas DataFrame or equivalent)
+  - Computes the same feature set it currently uses (preserve logic), but returns the new dict
+  - Calls a calibrator API to produce prob; include a fallback (if calibrator not present, return prob = score clipped to 0-1 and tag "uncalibrated")
+  - Includes an example usage at the bottom and a 2-line unit test demonstrating expected dict keys.
+
+B. New files to implement (complete code for each)
+1) decision_log.py
+- Behavior: append-only JSON Lines file writer for decisions. Thread-safe (file lock or atomic append). Minimal dependency; use file write + os.open flags if possible.
+- API:
+  - log_decision(decision: dict, path: str = "audit/decision_log.jsonl") -> None
+  - read_last(n: int = 100, path: str = "audit/decision_log.jsonl") -> List[dict]
+  - query(filter_fn: Callable[[dict], bool], path: str = "audit/decision_log.jsonl") -> List[dict]
+- Each log entry must include: timestamp (ISO8601 UTC), module, symbol, decision in {"act", "no_act", "info"}, reasons (list), score, prob, evidence_refs, model_version, git_sha, run_id (uuid).
+- Provide code + example entries + small unit test.
+
+2) backtester.py and calibrator.py
+- backtester.py responsibilities:
+  - Accept historical time-aligned signals (timestamp, symbol, raw_score or prob) and realized outcomes within an outcome window (e.g., profit>threshold within 3 days).
+  - Compute TP/FP/FN/TN across thresholds, precision/recall, and calibration table: for bins of predicted probability show observed hit rate.
+  - Save calibration data and recommended abstain thresholds to thresholds.json with metadata (target FPR or target precision).
+  - Provide functions:
+    - backtest_signals(signals_df: pd.DataFrame, outcomes_df: pd.DataFrame, outcome_window_days: int) -> dict (metrics + threshold table)
+    - recommend_threshold(metrics: dict, target_fpr: float = 0.05) -> float
+- calibrator.py responsibilities:
+  - Provide a function calibrate_score(raw_scores: np.ndarray, labels: np.ndarray) -> CalibrationModel which implements isotonic or Platt scaling. Persist fitted calibrator to disk (pickle or JSON for parameters) and expose:
+    - calibrator.predict(raw_score) -> float prob
+    - calibrator.save(path)
+    - calibrator.load(path)
+- Provide code for backtester and calibrator with scikit-learn usage (IsotonicRegression or LogisticRegression), plus small examples and tests.
+
+3) veto.py
+- Implement concrete veto functions and an aggregator:
+  - cooldown_veto(symbol, last_action_ts, cooldown_minutes) -> (bool, reason)
+  - exposure_veto(symbol, portfolio_state, exposure_limits) -> (bool, reason)
+  - liquidity_veto(symbol, orderbook_snapshot, min_depth) -> (bool, reason)
+  - evidence_veto(mcp_object, required_sources) -> (bool, reason)
+- Provide public API:
+  - evaluate_vetoes(signal_context: dict, veto_config: dict) -> (allowed: bool, veto_reasons: list)
+- Provide code and integration examples in orchestrator context.
+
+4) mcp_adapter.py (MCP-lite wrapper)
+- Purpose: produce a consistent structure for every signal for provenance and audit.
+- Output schema fields:
+  - id, ts, type ("fact"|"interpretation"), evidence (list of {source, query, timestamp, snapshot_ref}), computation_steps (list of strings), score, prob, confidence, model_version, git_sha
+- Provide code to create MCP-wrapped output from Attention score dict and attach data snapshot URLs.
+
+C. Integration edits (show exact code diffs or function-level edits)
+- Early signal:
+  - Before emitting a signal, call attention_score.compute(...). If prob < thresholds['abstain'] then call decision_log.log_decision with decision "no_act" and reason ["below_abstain_threshold"] and do not forward to Debate/Orchestrator.
+  - If prob >= thresholds['investigate'] then wrap with mcp_adapter and pass to Debate.
+- Debate:
+  - Ensure each agent's evaluation result is logged to decision_log with agent id, vote (act|no_act|info), confidence, and reasons.
+  - After votes, compute weighted consensus using calibrated probs and agent historical accuracy (store agent stats in agent_stats.json updated after each backtest).
+- Orchestrator:
+  - On final "act" consensus, run veto.evaluate_vetoes(signal_context). If veto denies action, log "no_act" with veto reasons. If allowed, do a dry-run simulation (simulate slippage using orderbook snapshot, estimate expected P/L) and log simulation result before executing.
+  - When executing, write an execution_report to audit/exec_reports/<run_id>.json containing expected vs actual fill, slippage, time, orderbook snapshot references.
+- Watch Agent:
+  - Add periodic data integrity checks: missing data => log "no_act" reason "stale_data" and mark symbol unhealthy.
+- Dashboard:
+  - Add pages/widgets:
+    - Decision log viewer (filter by module/symbol/date)
+    - Calibration curve (predicted probability vs observed frequency) using outputs from backtester
+    - Threshold tester (slider to see expected FP/TP on historical backtest given threshold)
+    - "Top reasons for no_action" aggregated view
+
+D. Exact JSON schemas to use (copy/paste)
+1) Decision log entry (single JSON line)
+{"ts":"2026-09-06T12:00:00Z","module":"early_signal","symbol":"BTCUSDT","decision":"no_act","reasons":["below_abstain_threshold","low_liquidity"],"score":0.41,"prob":0.35,"evidence_refs":["ohlcv:2026-09-06T12:00:00Z","orderbook_snapshot:sha123"],"model_version":"attention-v1.2.0","git_sha":"<commit-sha>","run_id":"<uuid4>"}
+
+2) MCP-lite signal object
+{"id":"uuid","ts":"2026-09-06T12:00:00Z","type":"interpretation","evidence":[{"source":"ohlcv","query":"BTCUSDT 1m last 60","snapshot_ref":"s3://bucket/ohlcv/BTCUSDT/2026-09-06T..."}],"computation_steps":["compute rsi (14)","compute volume_zscore","combine weighted avg"],"score":0.62,"prob":0.54,"confidence":0.54,"model_version":"attention-v1.2.0","git_sha":"<commit-sha>"}
+
+3) thresholds.json (calibration output)
+{"generated_at":"2026-09-06T12:00:00Z","model_version":"attention-v1.2.0","git_sha":"<commit-sha>","recommended_abstain_threshold":0.65,"recommended_execute_threshold":0.80,"target_fpr":0.05,"metrics":{"precision_at_0.65":0.71,"fpr_at_0.65":0.04,"avg_return_3d_at_0.65":0.023}}
+
+E. Backtest methodology (text for Claude)
+- Define "event" as a signal at timestamp t with predicted prob p and target asset.
+- Define outcome window W (e.g., 3 days). For each signal, compute whether return over W exceeded target T (e.g., +2% for long signals).
+- For each threshold tau in [0.0,1.0], compute:
+  - Signals with p >= tau
+  - TP = signals where outcome was positive; FP otherwise
+  - Precision = TP / (TP + FP); FPR relative to all non-events
+- Build calibration bins (10 or 20 bins), for each bin compute empirical hit rate. Use isotonic regression or Platt scaling to map raw_score -> calibrated prob.
+- Choose recommended_abstain_threshold to meet target FPR or target precision based on operator preference.
+
+F. Practical constraints and priorities (explicit)
+- Minimal viable change first:
+  1) Add decision_log and integrate into Early signal so the system never drops a signal without logging it.
+  2) Run a basic backtest to derive an initial abstain threshold; store to thresholds.json.
+  3) Add veto.py with a small set of vetoes (cooldown, exposure, liquidity).
+- Secondary:
+  - Replace single-agent signals with Debate multi-agent voting and log each vote.
+  - Expose calibration curves in Dashboard and enable threshold tuning.
+- Keep code readable, documented, and testable.
+
+G. Tests and validation to request Claude to produce
+- Unit tests for decision_log: append and read_last correctness.
+- Small synthetic backtest example: generate synthetic signals and outcomes, run backtester.recommend_threshold(target_fpr=0.05) and assert output threshold is reasonable for known synthetic distribution.
+- Integration example: run Attention score on a short OHLCV sample, get MCP-wrapped output, call calibrator.predict, call veto.evaluate_vetoes (with a synthetic orderbook), and ensure that decision_log contains a "no_act" log if conditions trigger.
+
+H. Security and audit best-practices to request
+- Make audit/decision_log.jsonl append-only in normal operation; prefer write-only ACL or write-once S3 for production.
+- Include model_version and git_sha in every decision record.
+- Use machine-readable evidence_refs pointing to immutable snapshots (S3/object storage or database with versioning) rather than ephemeral local files.
+- Timestamp everything in ISO8601 UTC, use run_id for grouping.
+
+I. Concrete next steps (pick one)
+- Option 1: Generate full starter code for decision_log.py, backtester.py, calibrator.py, veto.py, mcp_adapter.py and a modified Attention score module that integrates with them. Include unit tests and usage examples.
+- Option 2: Only produce decision_log.py + modified Attention score (minimal set to ensure no-signal paths are logged and the Attention score API returns structured data).
+- Option 3: Produce the full integration diff patch (git-style patch) that you can apply to the repo.
+
+Please proceed with Option 1 (full starter code) unless I tell you otherwise. Provide completed Python code files and short tests/examples for each file, and include an README excerpt describing how to run the backtester to compute thresholds and how to wire thresholds.json into Orchestrator.
+
+Notes for you (Claude) about style and constraints
+- Keep Python 3.9+ compatibility.
+- Use typing hints everywhere.
+- Favor standard library for decision_log (avoid heavy dependencies). For calibration/backtesting, you may use numpy, pandas, scikit-learn. If you use them, list pip install lines.
+- Keep functions small and testable with small synthetic datasets in the examples.
+- Ensure code writes/read files relative to repo root by default (e.g., audit/, data/, models/ directories).
+
+---
+
+End of prompt. Paste all of the above to Claude and ask them to: 1) generate the starter files and tests, 2) show example run commands, 3) produce the minimal integration snippets to put into Early signal, Debate, Orchestrator, Watch Agent, and Dashboard modules.
+
+If you want, I can now:
+- Generate the starter files here (decision_log.py, backtester.py, calibrator.py, veto.py, mcp_adapter.py) with example tests and the modified Attention score implementation, sized to slot into your repo. Say "Yes, generate files" and I will produce them.
