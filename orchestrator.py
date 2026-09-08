@@ -2,8 +2,9 @@
 Portfolio Attention Scanner — Orchestrator
 --------------------------------------------
 Ties the full pipeline together: live Binance data -> statistical scoring ->
-news correlation -> (optional) trade attempt. This is the Track B piece:
-an agent connected to Binance via MCP, making real decisions from real data.
+news correlation -> (optional) trade attempt. This is the agent's core
+decision pipeline for Track A (Agent Creation): an autonomous agent
+connected to Binance via MCP, making real decisions from real data.
 
 WHY THIS ISN'T A STANDALONE "CALL THE BINANCE API" SCRIPT:
 Binance's MCP server is what exposes market data and trading to an AI agent
@@ -38,6 +39,15 @@ from attention_score import Holding, NewsItem, run_portfolio_scan
 from dashboard import render_dashboard
 from early_signal import scan_for_early_signals
 from debate import generate_debate, print_debate
+from veto import evaluate_vetoes
+from decision_log import log_decision
+
+# Hard per-trade dollar cap, enforced BEFORE any order reaches the exchange.
+# This is not a suggestion or a soft warning -- if the requested trade
+# exceeds this, the order is never sent, no matter what the pipeline's
+# scoring decided. $5 gives headroom above the real $1.90 trade this demo
+# replays, while still being a meaningful ceiling for a hackathon-scale demo.
+MAX_NOTIONAL_PER_TRADE_USDT = 5.0
 
 
 # ---------------------------------------------------------------------------
@@ -178,9 +188,37 @@ def attempt_trade_on_top_result(bridge: MCPBridge, results: list, budget_usdt: f
     Attempts a real trade on the top-scoring symbol using the given budget.
     Always reports the real exchange response, including rejections —
     the pipeline never fakes a successful fill.
+
+    Before even contacting the exchange, the trade is checked against a
+    hard per-trade notional cap (veto.notional_veto). This is a
+    non-negotiable dollar limit that applies regardless of how strong the
+    attention score or debate outcome is -- statistical confidence never
+    overrides this gate. The check and its outcome are logged to the same
+    decision journal the rest of the pipeline uses, so a blocked trade is
+    just as auditable as an executed one.
     """
     top = results[0]
     symbol_pair = f"{top['symbol']}USDT"
+
+    allowed, veto_reasons = evaluate_vetoes(
+        {"symbol": top["symbol"]},
+        {"notional": {"order_notional_usdt": budget_usdt,
+                       "max_notional_usdt": MAX_NOTIONAL_PER_TRADE_USDT}},
+    )
+
+    if not allowed:
+        print(f"\n=== Trade Attempt ===")
+        print(f"Top attention score: {top['symbol']} ({top['score']}/100)")
+        print(f"  BLOCKED before reaching the exchange: {'; '.join(veto_reasons)}")
+        print(f"  This is a hard pre-trade gate, not an exchange rejection --")
+        print(f"  the order was never sent.")
+        log_decision(
+            module="orchestrator", symbol=top["symbol"], decision="no_act",
+            reasons=veto_reasons, requested_notional_usdt=budget_usdt,
+            max_notional_usdt=MAX_NOTIONAL_PER_TRADE_USDT,
+        )
+        return
+
     print(f"\n=== Trade Attempt ===")
     print(f"Top attention score: {top['symbol']} ({top['score']}/100)")
     print(f"Attempting BUY {symbol_pair} with {budget_usdt} USDT...")
@@ -193,6 +231,11 @@ def attempt_trade_on_top_result(bridge: MCPBridge, results: list, budget_usdt: f
         print(f"  This is a real response from Binance's live matching engine —")
         print(f"  the pipeline attempted a genuine trade and is reporting the")
         print(f"  genuine outcome, not a simulated success.")
+        log_decision(
+            module="orchestrator", symbol=top["symbol"], decision="no_act",
+            reasons=[f"exchange rejected: [{result['code']}] {result['message']}"],
+            requested_notional_usdt=budget_usdt,
+        )
     else:
         fill = result["fills"][0]
         filled_symbol = result["symbol"].replace("USDT", "")
@@ -211,6 +254,11 @@ def attempt_trade_on_top_result(bridge: MCPBridge, results: list, budget_usdt: f
         print(f"    Bought {result['executedQty']} {filled_symbol} "
               f"at {fill['price']} (spent {result['cummulativeQuoteQty']} USDT)")
         print(f"    Commission: {fill['commission']} {fill['commissionAsset']}")
+        log_decision(
+            module="orchestrator", symbol=top["symbol"], decision="act",
+            reasons=[f"order filled: {result['orderId']}"],
+            requested_notional_usdt=budget_usdt, order_id=result["orderId"],
+        )
 
 
 def run_pipeline(bridge: MCPBridge, budget_usdt: Optional[float] = None,
